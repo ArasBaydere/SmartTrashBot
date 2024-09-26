@@ -1,104 +1,140 @@
-#include <ESP8266WiFi.h> // ESP8266 kullanıyorsanız
-#include <WiFiClient.h>
+#include <CustomQTRSensors.h>
+#include <Servo.h>
 
-const char* ssid = "YOUR_SSID"; // WiFi SSID
-const char* password = "YOUR_PASSWORD"; // WiFi şifresi
-const char* host = "your-api-host.com"; // API sunucu adresi
+#define NUM_SENSORS 4
+#define TIMEOUT 2000
+#define EMITTER_PIN 2
 
-const int sol_enable = 11;
-const int sag_ileri = 10;
-const int sag_geri = 9;
-const int sol_ileri = 8;
-const int sol_geri = 7;
-const int sag_enable = 6;
+QTRSensorsRC qtrrc((unsigned char[]) {A0, A1, A2, A3}, NUM_SENSORS, TIMEOUT, EMITTER_PIN);
+unsigned int sensorValues[NUM_SENSORS];
+unsigned int position;
+
+const int motorSolPin1 = 3;
+const int motorSolPin2 = 4;
+const int motorSagPin1 = 5;
+const int motorSagPin2 = 6;
+
+Servo damperServo;
+Servo escMotor;
+const int servoPini = 9;
+const int escPin = 10;
+
+const int trigPini = 11;
+const int echoPini = 12;
+
+int motorHiziSol = 100;
+int motorHiziSag = 100;
+
+unsigned long gecikmeSuresi = 2000;
+bool damperAcik = false;
 
 void setup() {
   Serial.begin(9600);
-  pinMode(sag_ileri, OUTPUT);
-  pinMode(sag_geri, OUTPUT);
-  pinMode(sol_ileri, OUTPUT);
-  pinMode(sol_geri, OUTPUT);
-  pinMode(sag_enable, OUTPUT);
-  pinMode(sol_enable, OUTPUT);
-  
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("Connected to WiFi");
+
+  pinMode(motorSolPin1, OUTPUT);
+  pinMode(motorSolPin2, OUTPUT);
+  pinMode(motorSagPin1, OUTPUT);
+  pinMode(motorSagPin2, OUTPUT);
+
+  damperServo.attach(servoPini);
+  escMotor.attach(escPin);
+
+  escMotor.writeMicroseconds(1000);
+  delay(2000);
+
+  pinMode(trigPini, OUTPUT);
+  pinMode(echoPini, INPUT);
+
+  damperServo.write(0);
 }
 
 void loop() {
-  WiFiClient client;
-  if (client.connect(host, 80)) { // API'ye bağlan
-    client.print(String("GET /api/commands/ HTTP/1.1\r\n") +
-                 "Host: " + host + "\r\n" +
-                 "Connection: close\r\n\r\n");
-    delay(500);
-    
-    while (client.available()) {
-      String line = client.readStringUntil('\r');
-      if (line.startsWith("Command: ")) {
-        char gelen_veri = line.charAt(9); // Komut karakterini al
-        Serial.println(gelen_veri); // Gelen veriyi seri monitöre yazdır
-
-        // Motorları kontrol et
-        switch (gelen_veri) {
-          case 'F': // İleri hareket
-            digitalWrite(sag_ileri, HIGH);
-            digitalWrite(sag_geri, LOW);
-            digitalWrite(sol_ileri, HIGH);
-            digitalWrite(sol_geri, LOW);
-            analogWrite(sag_enable, 255); // Motor hızlarını ayarla
-            analogWrite(sol_enable, 255);
-            break;
-
-          case 'R': // Sağ ileri
-            digitalWrite(sag_ileri, HIGH);
-            digitalWrite(sag_geri, LOW);
-            digitalWrite(sol_ileri, LOW);
-            digitalWrite(sol_geri, LOW);
-            analogWrite(sag_enable, 255);
-            analogWrite(sol_enable, 0);
-            break;
-
-          case 'L': // Sol ileri
-            digitalWrite(sag_ileri, LOW);
-            digitalWrite(sag_geri, LOW);
-            digitalWrite(sol_ileri, HIGH);
-            digitalWrite(sol_geri, LOW);
-            analogWrite(sag_enable, 0);
-            analogWrite(sol_enable, 255);
-            break;
-
-          case 'B': // Geri hareket
-            digitalWrite(sag_ileri, LOW);
-            digitalWrite(sag_geri, HIGH);
-            digitalWrite(sol_ileri, LOW);
-            digitalWrite(sol_geri, HIGH);
-            analogWrite(sag_enable, 255);
-            analogWrite(sol_enable, 255);
-            break;
-
-          case 'S': // Dur
-            digitalWrite(sag_ileri, LOW);
-            digitalWrite(sag_geri, LOW);
-            digitalWrite(sol_ileri, LOW);
-            digitalWrite(sol_geri, LOW);
-            analogWrite(sag_enable, 0);
-            analogWrite(sol_enable, 0);
-            break;
-
-          default:
-            // Geçersiz komutlar için bir şey yapma
-            break;
-        }
-      }
-    }
-    client.stop();
-  } else {
-    Serial.println("Connection failed");
+  if (copTespit()) {
+    cizgiTakip();
   }
-  delay(10000); // Her 10 saniyede bir isteği tekrar et
+
+  position = qtrrc.readLine(sensorValues);
+  for (unsigned char i = 0; i < NUM_SENSORS; i++) {
+    Serial.print(sensorValues[i]);
+    Serial.print('\t');
+  }
+  Serial.println(position);
+  Serial.println(copTespit() ? "Çöp algılandı" : "Çöp algılanmadı");
+
+  delay(500);
+}
+
+bool copTespit() {
+  digitalWrite(trigPini, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPini, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPini, LOW);
+
+  long sure = pulseIn(echoPini, HIGH);
+  long mesafe = sure * 0.034 / 2;
+
+  Serial.print("Mesafe: ");
+  Serial.print(mesafe);
+  Serial.println(" cm");
+
+  if (mesafe < 10) {
+    return true;
+  } else {
+    return false;
+  }
+}
+
+void cizgiTakip() {
+  if (copTespit()) {
+    motorlariDurdur();
+    copBosalt();
+    return;
+  }
+
+  if (position > 200) {
+    motorHiziAyarla(motorHiziSol, motorHiziSag);
+  } else if (sensorValues[0] > 200) {
+    motorHiziAyarla(motorHiziSol / 2, motorHiziSag);
+  } else if (sensorValues[3] > 200) {
+    motorHiziAyarla(motorHiziSol, motorHiziSag / 2);
+  } else {
+    motorHiziAyarla(motorHiziSol, motorHiziSag);
+  }
+}
+
+void motorHiziAyarla(int solHiz, int sagHiz) {
+  analogWrite(motorSolPin1, solHiz);
+  analogWrite(motorSolPin2, 0);
+  analogWrite(motorSagPin1, sagHiz);
+  analogWrite(motorSagPin2, 0);
+}
+
+void motorlariDurdur() {
+  analogWrite(motorSolPin1, 0);
+  analogWrite(motorSagPin1, 0);
+}
+
+void copBosalt() {
+  Serial.println("Çöp boşaltma işlemi başlatılıyor...");
+
+  damperServo.write(90);
+  delay(2000);
+
+  Serial.println("ESC motoru çalıştırılıyor...");
+  for (int speed = 1000; speed <= 1050; speed += 10) {
+    escMotor.writeMicroseconds(speed);
+    delay(200);
+  }
+
+  delay(3000);
+
+  Serial.println("ESC motoru durduruluyor...");
+  escMotor.writeMicroseconds(1000);
+  delay(1000);
+
+  damperServo.write(0);
+  delay(2000);
+
+  Serial.println("Çöp boşaltma işlemi tamamlandı.");
 }
